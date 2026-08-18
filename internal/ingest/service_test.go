@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/convin/webhook-ingest/internal/testutil"
@@ -80,5 +81,62 @@ func TestDuplicateDeliveryIsIgnored(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("stored %d copies of %s, want 1", n, eventID)
+	}
+}
+
+func TestConcurrentDuplicateDeliveryCountsOnce(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+
+	const n = 20
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	statusCodes := make([]int, n)
+	errs := make([]error, n)
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			resp, err := http.Post(srv.URL+"/webhooks/calls", "application/json", strings.NewReader(body))
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			defer resp.Body.Close()
+			statusCodes[i] = resp.StatusCode
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i := range statusCodes {
+		if errs[i] != nil {
+			t.Fatalf("request %d: %v", i, errs[i])
+		}
+		if statusCodes[i] != http.StatusOK {
+			t.Fatalf("request %d: got status %d, want 200", i, statusCodes[i])
+		}
+	}
+
+	var eventCount int
+	row := st.Pool().QueryRow(ctx, `SELECT count(*) FROM events WHERE event_id = $1`, eventID)
+	if err := row.Scan(&eventCount); err != nil {
+		t.Fatalf("scan events: %v", err)
+	}
+	if eventCount != 1 {
+		t.Fatalf("stored %d event rows for %s, want 1", eventCount, eventID)
+	}
+
+	got, err := st.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if got.CallCount != 1 {
+		t.Fatalf("call_count = %d, want 1 — %d concurrent redeliveries were double-counted", got.CallCount, n)
 	}
 }
