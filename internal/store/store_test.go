@@ -26,8 +26,12 @@ func TestInsertEventThenExists(t *testing.T) {
 		t.Fatal("expected event to be absent before insert")
 	}
 
-	if err := s.InsertEvent(ctx, evt); err != nil {
+	inserted, err := s.InsertEvent(ctx, evt)
+	if err != nil {
 		t.Fatalf("InsertEvent: %v", err)
+	}
+	if !inserted {
+		t.Fatal("expected the first insert to report inserted=true")
 	}
 
 	exists, err = s.EventExists(ctx, eventID)
@@ -36,6 +40,74 @@ func TestInsertEventThenExists(t *testing.T) {
 	}
 	if !exists {
 		t.Fatal("expected event to exist after insert")
+	}
+}
+
+// TestInsertEventIsIdempotent locks in the fix for the duplicate-records
+// bug at the lowest level: inserting the same event_id twice must insert a
+// row exactly once, and the second call must say so via its return value
+// rather than erroring or silently inserting a second row.
+func TestInsertEventIsIdempotent(t *testing.T) {
+	s := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, s)
+	ctx := context.Background()
+
+	evt := store.Event{
+		EventID: eventID, CallID: callID, AccountID: accountID,
+		Status: "completed", DurationSec: 10, Payload: []byte(`{}`),
+	}
+
+	first, err := s.InsertEvent(ctx, evt)
+	if err != nil {
+		t.Fatalf("first InsertEvent: %v", err)
+	}
+	if !first {
+		t.Fatal("expected the first insert to report inserted=true")
+	}
+
+	second, err := s.InsertEvent(ctx, evt)
+	if err != nil {
+		t.Fatalf("second InsertEvent: %v", err)
+	}
+	if second {
+		t.Fatal("expected the redelivered insert to report inserted=false")
+	}
+
+	var n int
+	row := s.Pool().QueryRow(ctx, `SELECT count(*) FROM events WHERE event_id = $1`, eventID)
+	if err := row.Scan(&n); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("stored %d rows for %s, want 1", n, eventID)
+	}
+}
+
+// TestIngestEventSkipsSideEffectsOnDuplicate proves the transactional
+// wrapper: a redelivered event must not touch the call row or the account
+// aggregate a second time.
+func TestIngestEventSkipsSideEffectsOnDuplicate(t *testing.T) {
+	s := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, s)
+	ctx := context.Background()
+
+	evt := store.Event{
+		EventID: eventID, CallID: callID, AccountID: accountID,
+		Status: "completed", DurationSec: 30, Payload: []byte(`{}`),
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := s.IngestEvent(ctx, evt); err != nil {
+			t.Fatalf("IngestEvent delivery %d: %v", i, err)
+		}
+	}
+
+	got, err := s.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if got.CallCount != 1 || got.TotalDurationSec != 30 {
+		t.Fatalf("got %+v, want CallCount=1 TotalDurationSec=30 after 3 redeliveries", got)
 	}
 }
 
