@@ -1,6 +1,7 @@
 package stats_test
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/convin/webhook-ingest/internal/stats"
@@ -28,5 +29,33 @@ func TestCacheGetUnknownAccountIsZero(t *testing.T) {
 	c := stats.NewCache()
 	if got := c.Get("nobody"); got.CallCount != 0 || got.TotalDurationSec != 0 {
 		t.Fatalf("got %+v, want zero value", got)
+	}
+}
+
+// TestCacheRecordIsSafeForConcurrentUse catches the missing lock in Record.
+// Every real call comes through concurrent HTTP handlers, so this is not a
+// hypothetical: run this with `go test -race` against the unfixed code and
+// it reports a data race — several goroutines can race to create the very
+// first entry for an accountID via the unsynchronized `c.m[accountID] = s`,
+// which Go's map implementation detects as a fatal, unrecoverable
+// "concurrent map writes" error, not a normal test failure. Even without
+// -race, lost increments can quietly undercount CallCount.
+func TestCacheRecordIsSafeForConcurrentUse(t *testing.T) {
+	c := stats.NewCache()
+
+	const n = 200
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.Record("acc_1", 1)
+		}()
+	}
+	wg.Wait()
+
+	got := c.Get("acc_1")
+	if got.CallCount != n {
+		t.Fatalf("CallCount = %d, want %d (lost updates under concurrent access)", got.CallCount, n)
 	}
 }
