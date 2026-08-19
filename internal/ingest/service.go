@@ -16,6 +16,12 @@ import (
 // recordingWork stands in for downloading and transcoding a recording.
 const recordingWork = 50 * time.Millisecond
 
+// recordingTimeout bounds how long background recording processing is
+// allowed to run. It is intentionally independent of the HTTP request that
+// triggered it — the request may finish (and its context be canceled) long
+// before this background work is done.
+const recordingTimeout = 10 * time.Second
+
 // Service ingests webhook deliveries.
 type Service struct {
 	store *store.Store
@@ -67,11 +73,18 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 
 	s.cache.Record(rec.AccountID, rec.DurationSec)
 
-	// Recordings are slow to fetch, so that part does not block the provider.
+	// Recordings are slow to fetch, so that part does not block the
+	// provider. It deliberately does NOT reuse the request's context: once
+	// this handler returns, net/http cancels r.Context(), which would kill
+	// this work before it had a chance to run. It gets its own bounded
+	// context instead.
 	if rec.RecordingURL != "" {
 		go func() {
-			if err := s.processRecording(ctx, rec); err != nil {
-				// TODO: handle
+			bgCtx, cancel := context.WithTimeout(context.Background(), recordingTimeout)
+			defer cancel()
+			if err := s.processRecording(bgCtx, rec); err != nil {
+				s.log.Error("process recording failed",
+					"call_id", rec.CallID, "event_id", rec.EventID, "err", err)
 			}
 		}()
 	}
