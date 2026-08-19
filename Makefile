@@ -10,7 +10,7 @@ reset:
 	docker compose down -v && docker compose up -d --build
 
 test:
-	go test ./...
+	go test -race ./...
 
 logs:
 	docker compose logs -f app
