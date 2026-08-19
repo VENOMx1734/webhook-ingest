@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -28,6 +29,11 @@ type Service struct {
 	cache *stats.Cache
 	rdb   *redis.Client
 	log   *slog.Logger
+
+	// wg tracks recording-processing goroutines started by Ingest, so
+	// Shutdown can wait for in-flight work instead of abandoning it when
+	// the process exits.
+	wg sync.WaitGroup
 }
 
 // New builds a Service.
@@ -77,9 +83,12 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	// provider. It deliberately does NOT reuse the request's context: once
 	// this handler returns, net/http cancels r.Context(), which would kill
 	// this work before it had a chance to run. It gets its own bounded
-	// context instead.
+	// context instead, and wg lets Shutdown wait for it to finish on
+	// deploy rather than abandoning it when the process exits.
 	if rec.RecordingURL != "" {
+		s.wg.Add(1)
 		go func() {
+			defer s.wg.Done()
 			bgCtx, cancel := context.WithTimeout(context.Background(), recordingTimeout)
 			defer cancel()
 			if err := s.processRecording(bgCtx, rec); err != nil {
@@ -90,6 +99,25 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	}
 
 	return nil
+}
+
+// Shutdown waits for in-flight recording processing to finish, or for ctx
+// to be done, whichever comes first. Call it after the HTTP server has
+// stopped accepting new requests, so no new background work can start while
+// this is draining.
+func (s *Service) Shutdown(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // processRecording downloads and transcodes the call recording, then marks

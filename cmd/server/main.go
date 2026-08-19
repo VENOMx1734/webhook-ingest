@@ -57,7 +57,16 @@ func main() {
 	log.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
+
+	// Stop accepting new HTTP requests first, so no new background
+	// recording work can be started while we're draining.
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("shutdown", "err", err)
+	}
+
+	// Then wait (bounded by the same deadline) for recording processing
+	// that was already in flight, so a deploy doesn't silently drop it.
+	if err := svc.Shutdown(shutdownCtx); err != nil {
+		log.Error("shutdown: in-flight recording work did not finish in time", "err", err)
 	}
 }
